@@ -1,0 +1,212 @@
+// Bluetooth Low Energy, comunicação via bluetooth de curto alcance
+
+#include "ble.h"
+
+namespace Ble {
+    State state;
+}
+
+class MyServerCallbacks : public NimBLEServerCallbacks {
+public: 
+    void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
+        Ble::state.clientConnected = true;
+        Ble::state.mtu = connInfo.getMTU();
+        Serial.printf("[BLE] Client connected (MTU=%d)\n", Ble::state.mtu);
+    }
+
+    void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
+        Ble::state.clientConnected = false;
+        Ble::state.mtu = 23;
+        Serial.printf("[BLE] Client desconnected (reason=%d)\n", reason);
+        NimBLEDevice::startAdvertising();
+        }
+    };
+
+class MyRxCallbacks : public NimBLECharacteristicCallbacks {
+private:
+    bool tryParseManual(const char* data_str, size_t len) {
+        if (len < 5) return false;
+        
+        const char* modePos = strstr(data_str, "\"mode\":");
+        if (modePos) {
+            int mode = atoi(modePos + 7);
+            Ble::state.mode = mode;
+            
+            if (mode == 0) {
+                Telemetry::data.override_enabled = false;
+                Control::setSource(Control::Source::LOCAL);
+            } else {
+                Control::state.last_ms = millis();
+            }
+            return true;
+        }
+        
+        const char* pctPos = strstr(data_str, "\"pct\":");
+        if (pctPos) {
+            int pct = atoi(pctPos + 6);
+            pct = constrain(pct, 0, 100);
+            
+            Ble::state.pct = pct;
+            Telemetry::data.override_enabled = true;
+            Telemetry::data.override_pct = pct;
+            Control::setSource(Control::Source::BLE);
+            return true;
+        }
+        
+        return false;
+    }
+
+public:
+    void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+        std::string s = c->getValue();
+        if (s.empty()) return;
+    
+        const size_t len = s.length();
+        if (len > 128) {
+        Serial.printf("[BLE] Payload too large: %u bytes\n", len);
+        return;
+        }
+
+        Serial.printf("[BLE RX] %s\n", s.c_str());
+
+        JsonDocument doc; 
+        DeserializationError err = deserializeJson(doc, s);
+
+        if (err) {
+        Serial.printf("[BLE] JSON error: %s\n", err.c_str());
+
+        if (s[0] == '{' && tryParseManual(s.c_str(), len)) {
+            Serial.println("[BLE] Fallback parsing succeeded");
+        } else {
+            Serial.println("[BLE] Invalid format, ignored");
+        }
+        return;
+        }
+        
+        // MODO (0=local, 1+=BLE)
+        if (doc["mode"].is<int>()) {
+        int newMode = doc["mode"].as<int>();
+        Ble::state.mode = newMode;
+
+        if (newMode == 0) {
+            Telemetry::data.override_enabled = false;
+            Control::setSource(Control::Source::LOCAL);
+            Serial.println("[BLE] Local Mode activated");
+        } else {
+            Serial.printf("[BLE] BLE Mode %d activated\n", newMode);
+        }
+        }
+
+        // PCT override
+        if (doc["pct"].is<int>()) {
+        int pct = constrain(doc["pct"].as<int>(), 0, 100);
+
+        Ble::state.pct        = pct;
+        Telemetry::data.override_enabled = true;
+        Telemetry::data.override_pct     = Ble::state.pct;
+        Control::setSource(Control::Source::BLE);
+        Serial.printf("[BLE] Override PCT: %d%%\n", pct);
+        }
+    }
+};
+
+bool sendSpeedo() {
+    if (!Ble::state.clientConnected || !Ble::state.txChar) return false;
+    
+    JsonDocument doc;
+    
+    doc["mode"] = Ble::state.mode;
+    doc["speed_kmh"] = Telemetry::data.speed_kmh;
+    doc["rpm"] = Telemetry::data.rpm;
+    doc["pct"] = Telemetry::data.pct;
+    
+    doc["temp"] = isnan(Telemetry::data.temp) ? 0.0f : Telemetry::data.temp;
+    doc["current"] = isnan(Telemetry::data.current_bat_a) ? 0.0f : Telemetry::data.current_bat_a;
+    
+    doc["override"] = Telemetry::data.override_enabled;
+    if (Telemetry::data.override_enabled) {
+        doc["override_pct"] = Telemetry::data.override_pct;
+    }
+
+    char buffer[160];
+    size_t len = serializeJson(doc, buffer, sizeof(buffer));
+
+    if (len <= 0 || len >= sizeof(buffer)) {
+        Serial.println("[BLE] Serializing Json Error");
+        return false;
+    }
+
+    Ble::state.txChar->setValue((uint8_t*)buffer, len);
+    Ble::state.txChar->notify();
+    return true;
+}
+
+namespace Ble {
+    void setup() {
+        Serial.println(" ");
+        Serial.println("[BLE] Initializing...");
+
+        NimBLEDevice::init("EWolf-Telemetry");
+        NimBLEDevice::setDeviceName("EWolf-Telemetry");
+        NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+        NimBLEDevice::setMTU(128);
+
+        NimBLEServer* pServer = NimBLEDevice::createServer();
+        pServer->setCallbacks(new MyServerCallbacks()); 
+
+        static NimBLEUUID serviceUUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+        static NimBLEUUID charRxUUID ("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+        static NimBLEUUID charTxUUID ("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+
+        NimBLEService* pService = pServer->createService(serviceUUID);
+
+        // RX: comandos do app
+        Ble::state.rxChar = pService->createCharacteristic(
+            charRxUUID,
+            NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+        );
+        Ble::state.rxChar->setCallbacks(new MyRxCallbacks());
+
+        // TX: telemetria para app
+        Ble::state.txChar = pService->createCharacteristic(
+            charTxUUID,
+            NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
+        );
+
+        Ble::state.txChar->createDescriptor(
+            NimBLEUUID((uint16_t)0x2902),
+            NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE
+        );
+
+        //pService->start();
+
+        NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+        adv->addServiceUUID(serviceUUID);
+        adv->setName("EWolf-Telemetry");
+        adv->setMinInterval(32);
+        adv->setMaxInterval(48);
+
+        if (adv->start()) {
+            Serial.println("[BLE] Advertising inicialized as 'EWolf-Telemetry'");
+        } else {
+            Serial.println("[BLE] ERROR: Error of inicializing advertising!");
+        }
+        Serial.println(" ");
+    }
+
+    void loop() {
+        static uint32_t last = 0;
+        uint32_t now = millis();
+
+        if (now - last < 100) return;
+        last = now;
+
+        bool sent = sendSpeedo();
+
+        static uint32_t lastDebug = 0;
+        if (sent && now - lastDebug > 5000) {
+            Serial.printf("[BLE TX] Packed Sent\n");
+            lastDebug = now;
+        }
+    }
+}
